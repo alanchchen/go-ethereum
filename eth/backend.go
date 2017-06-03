@@ -44,6 +44,7 @@ import (
 	"github.com/ethereum/go-ethereum/miner"
 	"github.com/ethereum/go-ethereum/node"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/discover"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/rpc"
@@ -361,11 +362,27 @@ func (s *Ethereum) Downloader() *downloader.Downloader { return s.protocolManage
 // Protocols implements node.Service, returning all the currently configured
 // network protocols to start.
 func (s *Ethereum) Protocols() []p2p.Protocol {
-	if s.lesServer == nil {
-		return s.protocolManager.SubProtocols
-	} else {
-		return append(s.protocolManager.SubProtocols, s.lesServer.Protocols()...)
+	protocols := s.protocolManager.SubProtocols
+
+	// If we support Istanbul
+	protocols = append(protocols, istanbulProtocols(
+		s.protocolManager.process,
+		func() interface{} {
+			return s.protocolManager.NodeInfo()
+		},
+		func(id discover.NodeID) interface{} {
+			if p := s.protocolManager.peers.Peer(fmt.Sprintf("%x", id[:8])); p != nil {
+				return p.Info()
+			}
+			return nil
+		},
+	)...)
+
+	if s.lesServer != nil {
+		protocols = append(protocols, s.lesServer.Protocols()...)
 	}
+
+	return protocols
 }
 
 // Start implements node.Service, starting all internal goroutines needed by the

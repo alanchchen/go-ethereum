@@ -59,6 +59,8 @@ func errResp(code errCode, format string, v ...interface{}) error {
 	return fmt.Errorf("%v - %v", code, fmt.Sprintf(format, v...))
 }
 
+type HandlerFunc func(func() discover.NodeID, p2p.Msg, func(p2p.Msg) error) error
+
 type ProtocolManager struct {
 	networkId uint64
 
@@ -134,15 +136,7 @@ func NewProtocolManager(config *params.ChainConfig, mode downloader.SyncMode, ne
 			Version: version,
 			Length:  ProtocolLengths[i],
 			Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
-				peer := manager.newPeer(int(version), p, rw)
-				select {
-				case manager.newPeerCh <- peer:
-					manager.wg.Add(1)
-					defer manager.wg.Done()
-					return manager.handle(peer)
-				case <-manager.quitSync:
-					return p2p.DiscQuitting
-				}
+				return manager.process(p, rw, int(version), nil)
 			},
 			NodeInfo: func() interface{} {
 				return manager.NodeInfo()
@@ -245,69 +239,82 @@ func (pm *ProtocolManager) newPeer(pv int, p *p2p.Peer, rw p2p.MsgReadWriter) *p
 	return newPeer(pv, p, newMeteredMsgWriter(rw))
 }
 
-// handle is the callback invoked to manage the life cycle of an eth peer. When
+// Process is the callback invoked to manage the life cycle of an eth peer. When
 // this function terminates, the peer is disconnected.
-func (pm *ProtocolManager) handle(p *peer) error {
-	if pm.peers.Len() >= pm.maxPeers {
-		return p2p.DiscTooManyPeers
-	}
-	p.Log().Debug("Ethereum peer connected", "name", p.Name())
+func (pm *ProtocolManager) process(p *p2p.Peer, rw p2p.MsgReadWriter, version int, handler HandlerFunc) error {
+	newPeer := pm.newPeer(version, p, rw)
+	handle := func(p *peer) error {
+		if pm.peers.Len() >= pm.maxPeers {
+			return p2p.DiscTooManyPeers
+		}
+		p.Log().Debug("Ethereum peer connected", "name", p.Name())
 
-	// Execute the Ethereum handshake
-	td, head, genesis := pm.blockchain.Status()
-	if err := p.Handshake(pm.networkId, td, head, genesis); err != nil {
-		p.Log().Debug("Ethereum handshake failed", "err", err)
-		return err
-	}
-	if rw, ok := p.rw.(*meteredMsgReadWriter); ok {
-		rw.Init(p.version)
-	}
-	// Register the peer locally
-	if err := pm.peers.Register(p); err != nil {
-		p.Log().Error("Ethereum peer registration failed", "err", err)
-		return err
-	}
-	defer pm.removePeer(p.id)
-
-	// Register the peer in the downloader. If the downloader considers it banned, we disconnect
-	if err := pm.downloader.RegisterPeer(p.id, p.version, p.Head, p.RequestHeadersByHash, p.RequestHeadersByNumber, p.RequestBodies, p.RequestReceipts, p.RequestNodeData); err != nil {
-		return err
-	}
-	// Propagate existing transactions. new transactions appearing
-	// after this will be sent via broadcasts.
-	pm.syncTransactions(p)
-
-	// If we're DAO hard-fork aware, validate any remote peer with regard to the hard-fork
-	if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil {
-		// Request the peer's DAO fork header for extra-data validation
-		if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil {
+		// Execute the Ethereum handshake
+		td, head, genesis := pm.blockchain.Status()
+		if err := p.Handshake(pm.networkId, td, head, genesis); err != nil {
+			p.Log().Debug("Ethereum handshake failed", "err", err)
 			return err
 		}
-		// Start a timer to disconnect if the peer doesn't reply in time
-		p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() {
-			p.Log().Debug("Timed out DAO fork-check, dropping")
-			pm.removePeer(p.id)
-		})
-		// Make sure it's cleaned up if the peer dies off
-		defer func() {
-			if p.forkDrop != nil {
-				p.forkDrop.Stop()
-				p.forkDrop = nil
+		if rw, ok := p.rw.(*meteredMsgReadWriter); ok {
+			rw.Init(p.version)
+		}
+		// Register the peer locally
+		if err := pm.peers.Register(p); err != nil {
+			p.Log().Error("Ethereum peer registration failed", "err", err)
+			return err
+		}
+		defer pm.removePeer(p.id)
+
+		// Register the peer in the downloader. If the downloader considers it banned, we disconnect
+		if err := pm.downloader.RegisterPeer(p.id, p.version, p.Head, p.RequestHeadersByHash, p.RequestHeadersByNumber, p.RequestBodies, p.RequestReceipts, p.RequestNodeData); err != nil {
+			return err
+		}
+		// Propagate existing transactions. new transactions appearing
+		// after this will be sent via broadcasts.
+		pm.syncTransactions(p)
+
+		// If we're DAO hard-fork aware, validate any remote peer with regard to the hard-fork
+		if daoBlock := pm.chainconfig.DAOForkBlock; daoBlock != nil {
+			// Request the peer's DAO fork header for extra-data validation
+			if err := p.RequestHeadersByNumber(daoBlock.Uint64(), 1, 0, false); err != nil {
+				return err
 			}
-		}()
-	}
-	// main loop. handle incoming messages.
-	for {
-		if err := pm.handleMsg(p); err != nil {
-			p.Log().Debug("Ethereum message handling failed", "err", err)
-			return err
+			// Start a timer to disconnect if the peer doesn't reply in time
+			p.forkDrop = time.AfterFunc(daoChallengeTimeout, func() {
+				p.Log().Debug("Timed out DAO fork-check, dropping")
+				pm.removePeer(p.id)
+			})
+			// Make sure it's cleaned up if the peer dies off
+			defer func() {
+				if p.forkDrop != nil {
+					p.forkDrop.Stop()
+					p.forkDrop = nil
+				}
+			}()
 		}
+
+		// main loop. handle incoming messages.
+		for {
+			if err := pm.handle(p, handler); err != nil {
+				p.Log().Debug("Ethereum message handling failed", "err", err)
+				return err
+			}
+		}
+	}
+
+	select {
+	case pm.newPeerCh <- newPeer:
+		pm.wg.Add(1)
+		defer pm.wg.Done()
+		return handle(newPeer)
+	case <-pm.quitSync:
+		return p2p.DiscQuitting
 	}
 }
 
 // handleMsg is invoked whenever an inbound message is received from a remote
 // peer. The remote connection is torn down upon returning any error.
-func (pm *ProtocolManager) handleMsg(p *peer) error {
+func (pm *ProtocolManager) handle(p *peer, handler HandlerFunc) error {
 	// Read the next message from the remote peer, and ensure it's fully consumed
 	msg, err := p.rw.ReadMsg()
 	if err != nil {
@@ -318,6 +325,20 @@ func (pm *ProtocolManager) handleMsg(p *peer) error {
 	}
 	defer msg.Discard()
 
+	fallback := func(msg p2p.Msg) error {
+		return pm.handleMsg(p, msg)
+	}
+
+	if handler != nil {
+		if err := handler(p.ID, msg, fallback); err != nil {
+			return err
+		}
+	}
+
+	return fallback(msg)
+}
+
+func (pm *ProtocolManager) handleMsg(p *peer, msg p2p.Msg) error {
 	// Handle the message depending on its contents
 	switch {
 	case msg.Code == StatusMsg:
