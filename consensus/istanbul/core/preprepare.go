@@ -42,6 +42,10 @@ func (c *core) sendPreprepare(request *istanbul.Request) {
 			Code: msgPreprepare,
 			Msg:  preprepare,
 		})
+
+		logger.Debug("sendPreprepare", "current", c.current.Sequence(), "request", request.Proposal.Number())
+	} else {
+		logger.Debug("NOT sendPreprepare", "current", c.current.Sequence(), "request", request.Proposal.Number())
 	}
 }
 
@@ -103,6 +107,7 @@ func (c *core) handlePreprepare(msg *message, src istanbul.Validator) error {
 		// If it is locked, it can only process on the locked block
 		// Otherwise, broadcast PREPARE and enter Prepared state
 		if c.current.IsHashLocked() {
+			logger.Debug("We have locked hash", "hash", c.current.GetLockedHash().String(), "proposal", preprepare.Proposal.Hash().String())
 			// Broadcast COMMIT directly if the proposal matches the locked block
 			// Otherwise, send ROUND CHANGE
 			if preprepare.Proposal.Hash() == c.current.GetLockedHash() {
@@ -120,6 +125,8 @@ func (c *core) handlePreprepare(msg *message, src istanbul.Validator) error {
 			c.sendPrepare()
 		}
 	}
+
+	logger.Debug("handle PRE-PREPARE", "preprepare", preprepare)
 
 	return nil
 }

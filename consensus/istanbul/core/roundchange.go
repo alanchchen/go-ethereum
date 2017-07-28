@@ -60,6 +60,8 @@ func (c *core) sendRoundChange(round *big.Int) {
 		return
 	}
 
+	logger.Debug("round change", "round", cv.Round, "sequence", cv.Sequence)
+
 	c.broadcast(&message{
 		Code: msgRoundChange,
 		Msg:  payload,
@@ -74,6 +76,11 @@ func (c *core) handleRoundChange(msg *message, src istanbul.Validator) error {
 	if err := msg.Decode(&rc); err != nil {
 		logger.Error("Failed to decode round change", "err", err)
 		return errInvalidMessage
+	}
+
+	if !c.waitingForRoundChange {
+		logger.Warn("We are not waiting for ROUND-CHANGE, ignore")
+		return errIgnored
 	}
 
 	cv := c.currentView()
