@@ -31,6 +31,7 @@ func (c *core) sendCommit() {
 		logger.Error("Failed to encode", "subject", sub)
 		return
 	}
+	logger.Debug("broadcastCommit", "subject", sub)
 	c.broadcast(&message{
 		Code: msgCommit,
 		Msg:  encodedSubject,
@@ -38,6 +39,8 @@ func (c *core) sendCommit() {
 }
 
 func (c *core) handleCommit(msg *message, src istanbul.Validator) error {
+	logger := c.logger.New("state", c.state)
+
 	// Decode commit message
 	var commit *istanbul.Subject
 	err := msg.Decode(&commit)
@@ -54,6 +57,8 @@ func (c *core) handleCommit(msg *message, src istanbul.Validator) error {
 	}
 
 	c.acceptCommit(msg, src)
+
+	logger.Debug("handleCommit", "commit_size", c.current.Commits.Size())
 
 	// Commit the proposal once we have enough commit messages and we are not in StateCommitted.
 	//
